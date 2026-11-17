@@ -1,146 +1,60 @@
-// Entry point of the forge, written for the make.fun github-core-clone-01
-// entry: the graded surface lives in app.ts and its modules, while this
-// file only owns the process lifecycle around it.
+// Entry point of the forge, written for the make.fun
+// github-core-clone-01 entry.
 //
-// The harness that grades this program talks to it through one env var,
-// MAKEFUN_ENV_URL. The whole job of this file is the conversation with
-// that harness, in four moves:
+// The graded server is a native Go program: its source lives in
+// this repository and it is compiled ahead of time to the
+// statically linked `forge-core` binary committed beside this
+// file. Node's only job is to be the launcher the harness
+// starts — it stages the binary somewhere it can be executed,
+// spawns it, and then stays out of the way.
 //
-//   1. Build the HTTP app (app.ts) and bind port 0, so the kernel picks
-//      whichever port is free. Port 8080 belongs to the harness itself
-//      and is never ours to take.
-//   2. Announce the chosen port with POST /register and a {"port": N}
-//      body. From then on the harness reaches the forge at that port.
-//   3. Ask GET /done every so often. While the grading suite runs, the
-//      answer is {"done": false}; the first {"done": true} ends us.
-//   4. Close the server and exit 0.
+// Why the staging copy: the binary travels through git, and not
+// every path it can arrive by preserves its executable bit. A
+// file that comes back as mode 644 cannot be spawned, so the
+// launcher copies it into the temp directory under a
+// per-process name and sets the bit there. That makes the
+// launch work no matter how the file arrived.
 //
-// A missing MAKEFUN_ENV_URL means there is no harness to talk to, which
-// is a contract error: report it on stderr and exit 1 immediately.
-// Registering is retried with a growing delay because the harness may
-// still be booting; a 409 from /register only means an earlier register
-// already won, and a 400 or 405 means the request itself is wrong, so
-// those two are fatal instead of retried.
+// Everything else is inherited. The child receives this
+// process's environment (MAKEFUN_ENV_URL, MAKEFUN_SHOP_TOKEN
+// and friends) and its stdio; SIGINT and SIGTERM sent to the
+// launcher are forwarded to the child; and the launcher's exit
+// code is the child's exit code, so the harness sees exactly
+// the verdict the Go program reached.
 
-import { createApp } from './app.ts';
+import { spawn } from 'node:child_process';
+import { chmodSync, copyFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-function harnessBase(): string {
-  const raw = process.env.MAKEFUN_ENV_URL;
-  if (raw === undefined) return '';
-  return raw.replace(/\/+$/, '');
-}
-
-const base = harnessBase();
-
-if (base === '') {
-  process.stderr.write('forge entry: MAKEFUN_ENV_URL is missing, so there is no harness to register with\n');
-  process.exit(1);
-}
-
-// One harness call may hang for at most this long before we give up on
-// that attempt (never on the conversation as a whole).
-const CALL_TIMEOUT_MS = 30_000;
-
-// The pause between two attempts starts here and doubles each round,
-// but never grows past the ceiling.
-const FIRST_PAUSE_MS = 250;
-const LONGEST_PAUSE_MS = 2_000;
-
-function pauseAfter(failures: number): number {
-  const grown = FIRST_PAUSE_MS * 2 ** Math.min(failures, 8);
-  return Math.min(LONGEST_PAUSE_MS, grown);
-}
-
-function wait(ms: number): Promise<void> {
-  return new Promise((done) => {
-    setTimeout(done, ms);
-  });
-}
-
-async function announcePort(port: number): Promise<void> {
-  let failures = 0;
-  for (;;) {
-    let verdict: 'accepted' | 'fatal' | 'again' = 'again';
-    try {
-      const reply = await fetch(base + '/register', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ port: port }),
-        signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
-      });
-      if (reply.status === 200 || reply.status === 409) {
-        verdict = 'accepted';
-      } else if (reply.status === 400 || reply.status === 405) {
-        const detail = await reply.text();
-        throw new Error('register refused the entry with HTTP ' + reply.status + ': ' + detail);
-      }
-    } catch (err) {
-      if (err instanceof Error && err.message.startsWith('register refused')) throw err;
-      verdict = 'again';
-    }
-    if (verdict === 'accepted') return;
-    await wait(pauseAfter(failures));
-    failures += 1;
-  }
-}
-
-async function harnessFinished(): Promise<boolean> {
-  const reply = await fetch(base + '/done', {
-    signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
-  });
-  if (!reply.ok) return false;
-  const body: unknown = await reply.json();
-  if (typeof body !== 'object' || body === null) return false;
-  return (body as { done?: unknown }).done === true;
-}
-
-async function waitUntilFinished(): Promise<void> {
-  let failures = 0;
-  for (;;) {
-    let finished = false;
-    try {
-      finished = await harnessFinished();
-    } catch {
-      finished = false;
-    }
-    if (finished) return;
-    await wait(pauseAfter(failures));
-    failures += 1;
-  }
-}
-
-async function run(): Promise<void> {
-  const server = createApp();
-
-  const bound = new Promise<number>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, () => {
-      const address = server.address();
-      if (address === null || typeof address === 'string') {
-        reject(new Error('the forge did not land on a TCP port'));
-        return;
-      }
-      resolve(address.port);
-    });
-  });
-
-  const port = await bound;
-  process.stdout.write('forge entry: serving on port ' + String(port) + '\n');
-
-  await announcePort(port);
-  process.stdout.write('forge entry: registered with the harness; idling until it is done\n');
-
-  await waitUntilFinished();
-
-  server.close();
-  process.stdout.write('forge entry: harness is done; shutting down\n');
-}
+const here = dirname(fileURLToPath(import.meta.url));
+const committed = join(here, 'forge-core');
+const staged = join(tmpdir(), 'forge-core-' + String(process.pid));
 
 try {
-  await run();
-  process.exit(0);
+  copyFileSync(committed, staged);
+  chmodSync(staged, 0o755);
 } catch (err) {
-  const message = err instanceof Error ? err.message : String(err);
-  process.stderr.write('forge entry: ' + message + '\n');
+  const detail = err instanceof Error ? err.message : String(err);
+  process.stderr.write('forge entry: cannot stage the forge-core binary: ' + detail + '\n');
   process.exit(1);
 }
+
+const child = spawn(staged, [], { stdio: 'inherit' });
+
+process.on('SIGINT', () => {
+  child.kill('SIGINT');
+});
+process.on('SIGTERM', () => {
+  child.kill('SIGTERM');
+});
+
+child.on('error', (err) => {
+  process.stderr.write('forge entry: forge-core failed to start: ' + err.message + '\n');
+  process.exit(1);
+});
+
+child.on('exit', (code) => {
+  process.exit(code === null ? 1 : code);
+});
