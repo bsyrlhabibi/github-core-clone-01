@@ -508,6 +508,8 @@ export interface RepoRec {
   description: string;
   priv: boolean;
   defaultBranch: string;
+  /** Bumped on every ref change; keys the git advertisement/fetch caches. */
+  refsVersion: number;
   refs: Map<string, string>;
   labels: Map<string, LabelRec>;
   issues: Map<number, IssueRec>;
@@ -541,6 +543,7 @@ export function createRepo(owner: string, name: string, description: string, pri
     description,
     priv,
     defaultBranch: 'main',
+    refsVersion: 0,
     refs: new Map(),
     labels: new Map(),
     issues: new Map(),
@@ -555,6 +558,17 @@ export function createRepo(owner: string, name: string, description: string, pri
 
 export function getRepo(owner: string, name: string): RepoRec | null {
   return repos.get(repoKey(owner, name)) ?? null;
+}
+
+/** Set a ref and bump the repo's refs version (git response caches key on it). */
+export function setRef(repo: RepoRec, ref: string, oid: string): void {
+  repo.refs.set(ref, oid);
+  repo.refsVersion += 1;
+}
+
+/** Delete a ref (when present) and bump the repo's refs version. */
+export function deleteRef(repo: RepoRec, ref: string): void {
+  if (repo.refs.delete(ref)) repo.refsVersion += 1;
 }
 
 export function deleteRepo(owner: string, name: string): boolean {
@@ -706,7 +720,7 @@ export function commitChanges(
     treeOid = updateTreePath(treeOid, path, blobOid);
   }
   const commit = makeCommit(treeOid, tip === undefined ? [] : [tip], message);
-  repo.refs.set(ref, commit);
+  setRef(repo, ref, commit);
   return commit;
 }
 
@@ -832,7 +846,7 @@ export function squashMerge(repo: RepoRec, pull: PullRec): MergeOutcome {
   const merged = tryMergeTrees(baseTip, headTip);
   if (!merged.ok) return { ok: false, reason: 'conflict' };
   const commit = makeCommit(merged.treeOid, [baseTip], `${pull.title} (#${pull.number})`);
-  repo.refs.set(`refs/heads/${pull.baseRef}`, commit);
+  setRef(repo, `refs/heads/${pull.baseRef}`, commit);
   pull.state = 'closed';
   pull.merged = true;
   pull.mergedAt = new Date().toISOString();

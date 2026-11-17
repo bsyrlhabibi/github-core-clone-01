@@ -9,11 +9,13 @@ import {
   ZERO_OID,
   collectReachable,
   commitViewOf,
+  deleteRef,
   getRepo,
   hashObject,
   isAncestor,
   objects,
   peelOid,
+  setRef,
   storeObject,
   treeEntriesOf,
   type GitObject,
@@ -614,11 +616,41 @@ function v2Arguments(packets: Packet[]): { command: string; args: string[] } | n
   return command === '' ? null : { command, args };
 }
 
+// ---------------------------------------------------------------------------
+// Git response caches
+//
+// Advertisements and ls-refs answers depend only on a repo's refs and
+// default branch, so they are cached against the repo's refsVersion (bumped
+// by every ref change). Fetch answers depend only on the immutable object
+// store and the oids a request names, so they are cached against the parsed
+// request itself and never need invalidation.
+
+const GIT_CACHE_LIMIT = 256;
+const gitResponseCache = new Map<string, Buffer>();
+
+function gitCached(key: string, build: () => Buffer): Buffer {
+  const hit = gitResponseCache.get(key);
+  if (hit !== undefined) return hit;
+  const built = build();
+  if (built.length <= 8 * 1024 * 1024) {
+    if (gitResponseCache.size >= GIT_CACHE_LIMIT) gitResponseCache.clear();
+    gitResponseCache.set(key, built);
+  }
+  return built;
+}
+
+function repoCacheKey(repo: RepoRec): string {
+  return `${repo.owner}/${repo.name}#${repo.refsVersion}#${repo.defaultBranch}`;
+}
+
 export function handleInfoRefs(repo: RepoRec, service: string, protocolV2: boolean): GitReply {
   if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
     return gitError(400, 'unknown service');
   }
-  const body = protocolV2 && service === 'git-upload-pack' ? v2Advertisement(service) : v0Advertisement(repo, service);
+  const body =
+    protocolV2 && service === 'git-upload-pack'
+      ? v2Advertisement(service)
+      : gitCached(`adv|${repoCacheKey(repo)}|${service}`, () => v0Advertisement(repo, service));
   return { status: 200, contentType: `application/x-${service}-advertisement`, body };
 }
 
@@ -628,7 +660,8 @@ export function handleUploadPack(repo: RepoRec, body: Buffer, protocolV2: boolea
     const parsed = v2Arguments(packets);
     if (parsed === null) return gitError(400, 'malformed protocol v2 request');
     if (parsed.command === 'ls-refs') {
-      return { status: 200, contentType: 'application/x-git-upload-pack-result', body: lsRefsResponse(repo, parsed.args) };
+      const body = gitCached(`lsr|${repoCacheKey(repo)}|${parsed.args.join('\n')}`, () => lsRefsResponse(repo, parsed.args));
+      return { status: 200, contentType: 'application/x-git-upload-pack-result', body };
     }
     if (parsed.command === 'fetch') {
       const wants: string[] = [];
@@ -642,8 +675,9 @@ export function handleUploadPack(repo: RepoRec, body: Buffer, protocolV2: boolea
         else if (arg.startsWith('deepen ')) depth = Number.parseInt(arg.slice(7), 10);
         else if (arg.startsWith('deepen-since ')) depth = null; // not used by the suite; treat as unbounded
       }
-      const plan = planFetch(wants, haves, shallow, depth);
-      return { status: 200, contentType: 'application/x-git-upload-pack-result', body: fetchResponseV2(plan) };
+      const key = `fetch2|${wants.join(',')}|${haves.join(',')}|${shallow.join(',')}|${depth}`;
+      const body = gitCached(key, () => fetchResponseV2(planFetch(wants, haves, shallow, depth)));
+      return { status: 200, contentType: 'application/x-git-upload-pack-result', body };
     }
     return gitError(400, `unknown command ${parsed.command}`);
   }
@@ -673,8 +707,9 @@ export function handleUploadPack(repo: RepoRec, body: Buffer, protocolV2: boolea
     }
   }
   if (!sawAny) return gitError(400, 'malformed upload-pack request');
-  const plan = planFetch(wants, haves, shallow, depth);
-  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: fetchResponseV0(plan) };
+  const key = `fetch0|${wants.join(',')}|${haves.join(',')}|${shallow.join(',')}|${depth}`;
+  const replyBody = gitCached(key, () => fetchResponseV0(planFetch(wants, haves, shallow, depth)));
+  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: replyBody };
 }
 
 interface PushCommand {
@@ -724,7 +759,7 @@ export function handleReceivePack(repo: RepoRec, body: Buffer): GitReply {
       continue;
     }
     if (command.newOid === ZERO_OID) {
-      repo.refs.delete(command.ref);
+      deleteRef(repo, command.ref);
       reports.push({ ref: command.ref, ok: true, reason: '' });
       continue;
     }
@@ -741,7 +776,7 @@ export function handleReceivePack(repo: RepoRec, body: Buffer): GitReply {
       reports.push({ ref: command.ref, ok: false, reason: 'non-fast-forward' });
       continue;
     }
-    repo.refs.set(command.ref, command.newOid);
+    setRef(repo, command.ref, command.newOid);
     reports.push({ ref: command.ref, ok: true, reason: '' });
   }
 

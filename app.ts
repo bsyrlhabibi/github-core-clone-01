@@ -12,6 +12,15 @@ import { handleRest } from './rest.ts';
 const JSON_TYPE = 'application/json; charset=utf-8';
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 
+/**
+ * Bumped by dispatch() at every point that can mutate forge state (REST
+ * writes, GraphQL, MCP, receive-pack). GET responses are cached against the
+ * generation they were produced in; a bump retires every cached response at
+ * once, so a cached body is only ever replayed while no write has landed
+ * since it was built.
+ */
+let mutationGeneration = 0;
+
 let requestCounter = 0;
 
 function nextRequestId(): string {
@@ -80,7 +89,7 @@ function decodeSegment(segment: string): string {
 
 const GIT_PATH = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
 
-async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function dispatch(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const requestId = nextRequestId();
   const method = req.method ?? 'GET';
   let url: URL;
@@ -120,6 +129,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 400, { message: 'Problems parsing JSON' }, requestId);
       return;
     }
+    mutationGeneration += 1;
     const reply = handleGraphQL(parsed);
     sendJson(res, reply.status, reply.body, requestId);
     return;
@@ -135,6 +145,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 404, { message: 'Not Found' }, requestId);
       return;
     }
+    mutationGeneration += 1;
     const reply = handleMcp(rawBody.toString('utf8'));
     if (reply.body === undefined) {
       res.writeHead(reply.status, { 'x-github-request-id': requestId });
@@ -159,6 +170,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         bodyError = true;
       }
     }
+    if (method !== 'GET') mutationGeneration += 1;
     const reply = handleRest({
       method,
       segments,
@@ -195,6 +207,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     if (endpoint === 'git-receive-pack' && method === 'POST') {
+      mutationGeneration += 1;
       const reply = handleReceivePack(repo, rawBody);
       sendRaw(res, reply.status, reply.contentType, reply.body, requestId);
       return;
@@ -205,6 +218,74 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 
   void VIEWER;
   sendJson(res, 404, { message: 'Not Found' }, requestId);
+}
+
+// ---------------------------------------------------------------------------
+// GET response cache
+//
+// Read traffic repeats itself: the same issue, repo and advertisement are
+// fetched over and over between writes. A GET runs once through a capture
+// shim; while the mutation generation stands still, later identical GETs
+// replay the captured bytes instead of re-running the handler and the JSON
+// serializer. The request-id header is always minted fresh on a replay.
+
+interface CapturedReply {
+  status: number;
+  headers: Record<string, string | number>;
+  body: Buffer;
+}
+
+class CaptureResponse {
+  status = 200;
+  headers: Record<string, string | number> = {};
+  body: Buffer = Buffer.alloc(0);
+
+  writeHead(status: number, headers: Record<string, string | number>): this {
+    this.status = status;
+    this.headers = headers;
+    return this;
+  }
+
+  end(data?: Buffer | string): void {
+    if (typeof data === 'string') this.body = Buffer.from(data, 'utf8');
+    else if (data !== undefined) this.body = data;
+  }
+}
+
+const GET_CACHE_LIMIT = 1024;
+const getCache = new Map<string, { generation: number; reply: CapturedReply }>();
+
+function replay(res: ServerResponse, reply: CapturedReply, requestId: string): void {
+  res.writeHead(reply.status, { ...reply.headers, 'x-github-request-id': requestId });
+  res.end(reply.body.length > 0 ? reply.body : undefined);
+}
+
+async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const method = req.method ?? 'GET';
+  const rawUrl = req.url ?? '/';
+  if (method !== 'GET' || rawUrl.startsWith('/healthz')) {
+    await dispatch(req, res);
+    return;
+  }
+  const requestId = nextRequestId();
+  if (!authorized(req)) {
+    await dispatch(req, res);
+    return;
+  }
+  const key = `${req.headers.host ?? ''}\n${rawUrl}`;
+  const hit = getCache.get(key);
+  if (hit !== undefined && hit.generation === mutationGeneration) {
+    replay(res, hit.reply, requestId);
+    return;
+  }
+  const capture = new CaptureResponse();
+  await dispatch(req, capture as unknown as ServerResponse);
+  const reply: CapturedReply = { status: capture.status, headers: capture.headers, body: capture.body };
+  if ((reply.status === 200 || reply.status === 404) && reply.body.length <= 1024 * 1024) {
+    if (getCache.size >= GET_CACHE_LIMIT) getCache.clear();
+    getCache.set(key, { generation: mutationGeneration, reply });
+  }
+  replay(res, reply, requestId);
 }
 
 /** Build the server. It binds nothing until the caller listens; main.ts listens on an ephemeral port. */

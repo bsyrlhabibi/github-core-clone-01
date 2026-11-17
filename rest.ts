@@ -16,6 +16,7 @@ import {
   parseTree,
   pullChanges,
   resolveRef,
+  setRef,
   squashMerge,
   storeObject,
   treeOfCommit,
@@ -268,7 +269,7 @@ function handleRepo(req: RestRequest, repo: RepoRec, seg: string[]): RestReply {
       if (typeof ref !== 'string' || !ref.startsWith('refs/')) return message(422, 'Validation Failed: ref is required');
       if (typeof sha !== 'string' || !objects.has(sha)) return message(422, 'Validation Failed: object does not exist');
       if (repo.refs.has(ref)) return message(422, 'Reference already exists');
-      repo.refs.set(ref, sha);
+      setRef(repo, ref, sha);
       return { status: 201, body: { ref, object: { sha, type: objects.get(sha)?.type ?? 'commit' } } };
     }
     if (seg.length >= 3 && method === 'GET') {
@@ -321,7 +322,7 @@ function targetBranchTip(repo: RepoRec, branch: string | undefined): { branch: s
   if (name !== repo.defaultBranch) {
     const baseTip = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
     if (baseTip !== undefined) {
-      repo.refs.set(`refs/heads/${name}`, baseTip);
+      setRef(repo, `refs/heads/${name}`, baseTip);
       return { branch: name, tip: baseTip };
     }
   }
