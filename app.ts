@@ -31,14 +31,14 @@ function sendJson(res: ServerResponse, status: number, body: unknown, requestId:
     res.end();
     return;
   }
-  const text = JSON.stringify(body);
+  const payload = Buffer.from(JSON.stringify(body), 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
+    'content-length': payload.length,
     'x-github-request-id': requestId,
     ...headers,
   });
-  res.end(text);
+  res.end(payload);
 }
 
 function sendRaw(res: ServerResponse, status: number, contentType: string, body: Buffer, requestId: string): void {
@@ -50,16 +50,24 @@ function sendRaw(res: ServerResponse, status: number, contentType: string, body:
   res.end(body);
 }
 
-async function readBody(req: IncomingMessage): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for await (const chunk of req) {
-    const buffer = chunk as Buffer;
-    total += buffer.length;
-    if (total > 128 * 1024 * 1024) throw new Error('request body too large');
-    chunks.push(buffer);
-  }
-  return Buffer.concat(chunks);
+function readBody(req: IncomingMessage): Promise<Buffer> {
+  // Event-driven collection: the async-iterator form costs noticeably more
+  // per request, and this runs on every POST the benchmark times.
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    req.on('data', (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > 128 * 1024 * 1024) {
+        reject(new Error('request body too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
 }
 
 function decodeSegment(segment: string): string {

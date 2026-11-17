@@ -210,6 +210,55 @@ export function parseTree(data: Buffer): TreeEntry[] {
   return entries;
 }
 
+// ---------------------------------------------------------------------------
+// Parsed-object caches
+//
+// Git objects are immutable and content-addressed, so a parse keyed by oid
+// stays valid forever. History walks, tree flattening and fetch planning used
+// to re-parse the same commits and trees on every request; these caches make
+// each object parse at most once. Callers must treat the returned views as
+// read-only. The caches clear wholesale past a generous size cap so a long
+// process cannot grow them without bound.
+
+const PARSE_CACHE_LIMIT = 100_000;
+
+const commitViewCache = new Map<string, CommitView>();
+const tagViewCache = new Map<string, TagView>();
+const treeEntriesCache = new Map<string, TreeEntry[]>();
+
+function cachePut<V>(cache: Map<string, V>, key: string, value: V): V {
+  if (cache.size >= PARSE_CACHE_LIMIT) cache.clear();
+  cache.set(key, value);
+  return value;
+}
+
+/** The parsed commit at `oid`, or null when it is missing or not a commit. */
+export function commitViewOf(oid: string): CommitView | null {
+  const cached = commitViewCache.get(oid);
+  if (cached !== undefined) return cached;
+  const object = objects.get(oid);
+  if (object === undefined || object.type !== 'commit') return null;
+  return cachePut(commitViewCache, oid, parseCommit(object.data));
+}
+
+/** The parsed tag at `oid`, or null when it is missing or not a tag. */
+export function tagViewOf(oid: string): TagView | null {
+  const cached = tagViewCache.get(oid);
+  if (cached !== undefined) return cached;
+  const object = objects.get(oid);
+  if (object === undefined || object.type !== 'tag') return null;
+  return cachePut(tagViewCache, oid, parseTag(object.data));
+}
+
+/** The entries of the tree at `oid`, or null when it is missing or not a tree. */
+export function treeEntriesOf(oid: string): TreeEntry[] | null {
+  const cached = treeEntriesCache.get(oid);
+  if (cached !== undefined) return cached;
+  const object = objects.get(oid);
+  if (object === undefined || object.type !== 'tree') return null;
+  return cachePut(treeEntriesCache, oid, parseTree(object.data));
+}
+
 function compareTreeNames(a: TreeEntry, b: TreeEntry): number {
   const left = Buffer.from(a.mode === '40000' ? `${a.name}/` : a.name, 'utf8');
   const right = Buffer.from(b.mode === '40000' ? `${b.name}/` : b.name, 'utf8');
@@ -239,7 +288,7 @@ export function peelOid(oid: string): { oid: string; type: GitObjectType } | nul
     const object = objects.get(current);
     if (object === undefined) return null;
     if (object.type !== 'tag') return { oid: current, type: object.type };
-    current = parseTag(object.data).object;
+    current = (tagViewOf(current) as TagView).object;
   }
   return null;
 }
@@ -261,13 +310,13 @@ export function collectReachable(roots: Iterable<string>): Set<string> {
     if (object === undefined) continue;
     seen.add(oid);
     if (object.type === 'commit') {
-      const commit = parseCommit(object.data);
+      const commit = commitViewOf(oid) as CommitView;
       queue.push(commit.tree);
       for (const parent of commit.parents) queue.push(parent);
     } else if (object.type === 'tag') {
-      queue.push(parseTag(object.data).object);
+      queue.push((tagViewOf(oid) as TagView).object);
     } else if (object.type === 'tree') {
-      for (const entry of parseTree(object.data)) {
+      for (const entry of treeEntriesOf(oid) as TreeEntry[]) {
         if (entry.mode === '160000') continue;
         queue.push(entry.oid);
       }
@@ -287,7 +336,7 @@ export function isAncestor(ancestor: string, descendant: string): boolean {
     seen.add(oid);
     const object = objects.get(oid);
     if (object === undefined || object.type !== 'commit') continue;
-    for (const parent of parseCommit(object.data).parents) {
+    for (const parent of (commitViewOf(oid) as CommitView).parents) {
       if (parent === ancestor) return true;
       queue.push(parent);
     }
@@ -307,7 +356,7 @@ export function ancestorDistances(tip: string): Map<string, number> {
       distances.set(oid, distance);
       const object = objects.get(oid);
       if (object !== undefined && object.type === 'commit') {
-        for (const parent of parseCommit(object.data).parents) next.push(parent);
+        for (const parent of (commitViewOf(oid) as CommitView).parents) next.push(parent);
       }
     }
     frontier = next;
@@ -342,9 +391,9 @@ export function mergeBase(a: string, b: string): string | null {
 export function flattenTree(treeOid: string): Map<string, string> {
   const out = new Map<string, string>();
   const walk = (oid: string, prefix: string): void => {
-    const object = objects.get(oid);
-    if (object === undefined || object.type !== 'tree') return;
-    for (const entry of parseTree(object.data)) {
+    const entries = treeEntriesOf(oid);
+    if (entries === null) return;
+    for (const entry of entries) {
       const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
       if (entry.mode === '40000') walk(entry.oid, path);
       else out.set(path, entry.oid);
@@ -472,6 +521,14 @@ let nextIssueId = 1;
 let nextPullId = 1;
 let nextCommentId = 1;
 
+// Forge-wide id indexes, filled at creation time. Global-id lookups (the
+// GraphQL node fields) used to scan every repo and every issue/pull in it;
+// these maps make them O(1). A hit is revalidated against the live maps
+// before it is trusted, and a miss falls back to the original scan.
+const reposById = new Map<number, RepoRec>();
+const issuesById = new Map<number, { repo: RepoRec; issue: IssueRec }>();
+const pullsById = new Map<number, { repo: RepoRec; pull: PullRec }>();
+
 export function repoKey(owner: string, name: string): string {
   return `${owner}/${name}`;
 }
@@ -492,6 +549,7 @@ export function createRepo(owner: string, name: string, description: string, pri
   };
   nextRepoId += 1;
   repos.set(repoKey(owner, name), repo);
+  reposById.set(repo.id, repo);
   return repo;
 }
 
@@ -520,6 +578,7 @@ export function createIssue(repo: RepoRec, title: string, body: string, labels: 
   nextIssueId += 1;
   repo.nextNumber += 1;
   repo.issues.set(issue.number, issue);
+  issuesById.set(issue.id, { repo, issue });
   return issue;
 }
 
@@ -549,6 +608,7 @@ export function createPull(
   nextPullId += 1;
   repo.nextNumber += 1;
   repo.pulls.set(pull.number, pull);
+  pullsById.set(pull.id, { repo, pull });
   return pull;
 }
 
@@ -561,6 +621,14 @@ export function addComment(issue: IssueRec, body: string): CommentRec {
 
 /** Find an issue anywhere by its forge-wide id (GraphQL global-id lookups). */
 export function findIssueById(id: number): { repo: RepoRec; issue: IssueRec } | null {
+  const indexed = issuesById.get(id);
+  if (
+    indexed !== undefined &&
+    repos.get(repoKey(indexed.repo.owner, indexed.repo.name)) === indexed.repo &&
+    indexed.repo.issues.get(indexed.issue.number) === indexed.issue
+  ) {
+    return indexed;
+  }
   for (const repo of repos.values()) {
     for (const issue of repo.issues.values()) {
       if (issue.id === id) return { repo, issue };
@@ -570,6 +638,14 @@ export function findIssueById(id: number): { repo: RepoRec; issue: IssueRec } | 
 }
 
 export function findPullById(id: number): { repo: RepoRec; pull: PullRec } | null {
+  const indexed = pullsById.get(id);
+  if (
+    indexed !== undefined &&
+    repos.get(repoKey(indexed.repo.owner, indexed.repo.name)) === indexed.repo &&
+    indexed.repo.pulls.get(indexed.pull.number) === indexed.pull
+  ) {
+    return indexed;
+  }
   for (const repo of repos.values()) {
     for (const pull of repo.pulls.values()) {
       if (pull.id === id) return { repo, pull };
@@ -579,6 +655,8 @@ export function findPullById(id: number): { repo: RepoRec; pull: PullRec } | nul
 }
 
 export function findRepoById(id: number): RepoRec | null {
+  const indexed = reposById.get(id);
+  if (indexed !== undefined && repos.get(repoKey(indexed.owner, indexed.name)) === indexed) return indexed;
   for (const repo of repos.values()) {
     if (repo.id === id) return repo;
   }
@@ -622,7 +700,7 @@ export function commitChanges(
 ): string {
   const ref = `refs/heads/${branch}`;
   const tip = repo.refs.get(ref);
-  let treeOid = tip === undefined ? EMPTY_TREE_OID : parseCommit((objects.get(tip) as GitObject).data).tree;
+  let treeOid = tip === undefined ? EMPTY_TREE_OID : (commitViewOf(tip) as CommitView).tree;
   for (const [path, content] of changes) {
     const blobOid = content === null ? null : storeObject('blob', content);
     treeOid = updateTreePath(treeOid, path, blobOid);
@@ -634,9 +712,8 @@ export function commitChanges(
 
 /** The tree oid at a commit, or the empty tree for an unknown oid. */
 export function treeOfCommit(commitOid: string): string {
-  const object = objects.get(commitOid);
-  if (object === undefined || object.type !== 'commit') return EMPTY_TREE_OID;
-  return parseCommit(object.data).tree;
+  const view = commitViewOf(commitOid);
+  return view === null ? EMPTY_TREE_OID : view.tree;
 }
 
 /** Resolve a branch name, full ref, or commit sha to a commit oid in this repo. */

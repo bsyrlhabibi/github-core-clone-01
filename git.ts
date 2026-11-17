@@ -8,14 +8,14 @@ import {
   TYPE_CODE,
   ZERO_OID,
   collectReachable,
+  commitViewOf,
   getRepo,
   hashObject,
   isAncestor,
   objects,
-  parseCommit,
-  parseTag,
   peelOid,
   storeObject,
+  treeEntriesOf,
   type GitObject,
   type GitObjectType,
   type RepoRec,
@@ -88,21 +88,51 @@ function writePackObjectHeader(type: GitObjectType, size: number): Buffer {
   return Buffer.from(bytes);
 }
 
+/** One object to place in a pack, with the oid it is stored under. */
+export interface PackEntry {
+  oid: string;
+  object: GitObject;
+}
+
+// Pack-building caches. Objects are immutable and content-addressed, so a
+// deflated entry and a whole pack keyed by its ordered object list stay
+// valid forever. Repeated clones of the same head used to re-walk, re-parse
+// and re-deflate every object and rebuild the identical pack each time.
+const PACK_CACHE_LIMIT = 64;
+const DEFLATE_CACHE_LIMIT = 100_000;
+const packCache = new Map<string, Buffer>();
+const deflatedEntryCache = new Map<string, Buffer>();
+
+function deflatedEntry(entry: PackEntry): Buffer {
+  const cached = deflatedEntryCache.get(entry.oid);
+  if (cached !== undefined) return cached;
+  const built = Buffer.concat([
+    writePackObjectHeader(entry.object.type, entry.object.data.length),
+    deflateSync(entry.object.data, { level: 1 }),
+  ]);
+  if (deflatedEntryCache.size >= DEFLATE_CACHE_LIMIT) deflatedEntryCache.clear();
+  deflatedEntryCache.set(entry.oid, built);
+  return built;
+}
+
 /** Build a packfile of plain objects (no deltas); the trailer is the SHA-1 of the body. */
-export function writePack(list: readonly GitObject[]): Buffer {
+export function writePack(list: readonly PackEntry[]): Buffer {
+  const key = list.map((entry) => entry.oid).join(' ');
+  const cachedPack = packCache.get(key);
+  if (cachedPack !== undefined) return cachedPack;
   const parts: Buffer[] = [];
   const header = Buffer.allocUnsafe(12);
   header.write('PACK', 0, 4, 'ascii');
   header.writeUInt32BE(2, 4);
   header.writeUInt32BE(list.length, 8);
   parts.push(header);
-  for (const object of list) {
-    parts.push(writePackObjectHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data));
-  }
+  for (const entry of list) parts.push(deflatedEntry(entry));
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();
-  return Buffer.concat([body, trailer]);
+  const pack = Buffer.concat([body, trailer]);
+  if (packCache.size >= PACK_CACHE_LIMIT) packCache.clear();
+  packCache.set(key, pack);
+  return pack;
 }
 
 function readVarintSize(buffer: Buffer, start: number): { size: number; next: number; first: number } {
@@ -311,47 +341,35 @@ export function readPackIntoStore(pack: Buffer): number {
 // Fetch set computation
 
 export interface FetchPlan {
-  packObjects: GitObject[];
+  packObjects: PackEntry[];
   shallow: string[];
   unshallow: string[];
 }
 
 /** Tree closure of one commit (the commit itself not included). */
 function treeClosure(commitOid: string, into: Set<string>): void {
-  const object = objects.get(commitOid);
-  if (object === undefined || object.type !== 'commit') return;
-  const stack = [parseCommit(object.data).tree];
+  const view = commitViewOf(commitOid);
+  if (view === null) return;
+  const stack = [view.tree];
   while (stack.length > 0) {
     const oid = stack.pop() as string;
     if (into.has(oid)) continue;
-    const entry = objects.get(oid);
-    if (entry === undefined) continue;
+    const entries = treeEntriesOf(oid);
+    if (entries === null) {
+      // Not a tree: a blob (or a missing object) closes here.
+      if (objects.has(oid)) into.add(oid);
+      continue;
+    }
     into.add(oid);
-    if (entry.type === 'tree') {
-      for (const child of parseTreeEntries(entry.data)) stack.push(child);
+    for (const entry of entries) {
+      if (entry.mode !== '160000') stack.push(entry.oid);
     }
   }
 }
 
-function parseTreeEntries(data: Buffer): string[] {
-  const out: string[] = [];
-  let offset = 0;
-  while (offset < data.length) {
-    const space = data.indexOf(0x20, offset);
-    if (space < 0) break;
-    const nul = data.indexOf(0x00, space + 1);
-    if (nul < 0 || nul + 21 > data.length) break;
-    const mode = data.subarray(offset, space).toString('ascii');
-    if (mode !== '160000') out.push(data.subarray(nul + 1, nul + 21).toString('hex'));
-    offset = nul + 21;
-  }
-  return out;
-}
-
 function commitParents(oid: string): string[] {
-  const object = objects.get(oid);
-  if (object === undefined || object.type !== 'commit') return [];
-  return parseCommit(object.data).parents;
+  const view = commitViewOf(oid);
+  return view === null ? [] : view.parents;
 }
 
 /**
@@ -431,11 +449,11 @@ export function planFetch(
   };
 }
 
-function materialize(oids: Set<string>): GitObject[] {
-  const out: GitObject[] = [];
+function materialize(oids: Set<string>): PackEntry[] {
+  const out: PackEntry[] = [];
   for (const oid of oids) {
     const object = objects.get(oid);
-    if (object !== undefined) out.push(object);
+    if (object !== undefined) out.push({ oid, object });
   }
   return out;
 }
